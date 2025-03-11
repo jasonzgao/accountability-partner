@@ -32,6 +32,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var notionCalendarService: NotionCalendarService!
     private var authenticationManager: AuthenticationManagerProtocol!
     private var synchronizationService: SynchronizationService!
+    private var goalRepository: GoalRepositoryProtocol!
+    private var goalTrackingService: GoalTrackingService!
+    private var habitDetectionService: HabitDetectionService!
+    private var notificationService: NotificationService!
     
     // MARK: - Service Access
     
@@ -90,6 +94,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return synchronizationService
     }
     
+    /// Returns the goal repository for use by view models
+    func getGoalRepository() -> GoalRepositoryProtocol {
+        return goalRepository
+    }
+    
+    /// Returns the goal tracking service for use by view models
+    func getGoalTrackingService() -> GoalTrackingService {
+        return goalTrackingService
+    }
+    
+    /// Returns the habit detection service for use by view models
+    func getHabitDetectionService() -> HabitDetectionService {
+        return habitDetectionService
+    }
+    
+    /// Returns the notification service for use by view models
+    func getNotificationService() -> NotificationService {
+        return notificationService
+    }
+    
     // MARK: - App Lifecycle
     
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -125,10 +149,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupThingsIntegration()
         
         // Setup Notion calendar integration
-        setupNotionCalendar()
+        setupNotionCalendarIntegration()
         
         // Setup synchronization service
         setupSynchronizationService()
+        
+        // Setup goal tracking
+        setupGoalTracking()
+        
+        // Setup habit detection
+        setupHabitDetection()
+        
+        // Setup notification service
+        setupNotificationService()
         
         // Setup activity monitor
         setupActivityMonitor()
@@ -143,8 +176,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Stop monitoring when app terminates
         activityMonitorService.stopMonitoring()
-        synchronizationService.stop()
-        logger.info("Activity monitoring and synchronization stopped due to app termination")
+        logger.info("Activity monitoring stopped due to app termination")
     }
     
     // MARK: - Setup Methods
@@ -215,8 +247,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    private func setupNotionCalendar() {
-        notionCalendarService = NotionAPICalendarService(authManager: authenticationManager)
+    private func setupNotionCalendarIntegration() {
+        notionCalendarService = NotionAPICalendarService()
         logger.info("Notion calendar integration service initialized")
     }
     
@@ -225,8 +257,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             thingsService: thingsIntegrationService,
             notionService: notionCalendarService
         )
-        synchronizationService.start()
         logger.info("Synchronization service initialized")
+    }
+    
+    private func setupGoalTracking() {
+        goalRepository = GoalRepository()
+        
+        goalTrackingService = DefaultGoalTrackingService(
+            goalRepository: goalRepository,
+            activityRepository: activityRepository
+        )
+        
+        logger.info("Goal repository and tracking service initialized")
+    }
+    
+    private func setupHabitDetection() {
+        habitDetectionService = DefaultHabitDetectionService(
+            activityRepository: activityRepository
+        )
+        
+        logger.info("Habit detection service initialized")
+    }
+    
+    private func setupNotificationService() {
+        notificationService = DefaultNotificationService()
+        
+        logger.info("Notification service initialized")
     }
     
     private func setupActivityMonitor() {
@@ -389,44 +445,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func openStatistics() {
-        let statisticsView = StatisticsView(
-            viewModel: StatisticsViewModel(
-                statisticsService: statisticsService
-            )
-        )
-        
         let statisticsWindow = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        statisticsWindow.center()
-        statisticsWindow.title = "Activity Statistics"
-        statisticsWindow.contentView = NSHostingView(rootView: statisticsView)
         
-        let statisticsWindowController = NSWindowController(window: statisticsWindow)
-        statisticsWindowController.showWindow(nil)
+        statisticsWindow.title = "Activity Statistics"
+        statisticsWindow.center()
+        statisticsWindow.contentView = NSHostingView(rootView: StatisticsView())
+        statisticsWindow.makeKeyAndOrderFront(nil)
     }
     
-    func openSynchronization() {
-        let synchronizationView = SynchronizationView(
-            viewModel: SynchronizationViewModel(
-                synchronizationService: synchronizationService
-            )
-        )
-        
-        let synchronizationWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),
+    func openGoals() {
+        let goalsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 500),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        synchronizationWindow.center()
-        synchronizationWindow.title = "Synchronization"
-        synchronizationWindow.contentView = NSHostingView(rootView: synchronizationView)
         
-        let synchronizationWindowController = NSWindowController(window: synchronizationWindow)
-        synchronizationWindowController.showWindow(nil)
+        goalsWindow.title = "Goals & Objectives"
+        goalsWindow.center()
+        goalsWindow.contentView = NSHostingView(rootView: GoalsView())
+        goalsWindow.makeKeyAndOrderFront(nil)
+    }
+    
+    func openHabits() {
+        let habitsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        
+        habitsWindow.title = "Habits & Insights"
+        habitsWindow.center()
+        habitsWindow.contentView = NSHostingView(rootView: HabitsView())
+        habitsWindow.makeKeyAndOrderFront(nil)
     }
 } 

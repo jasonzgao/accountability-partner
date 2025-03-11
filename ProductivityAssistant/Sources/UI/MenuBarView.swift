@@ -303,6 +303,24 @@ struct MenuBarView: View {
                     )
                     
                     actionButton(
+                        title: "Goals",
+                        icon: "target",
+                        action: { viewModel.openGoals() }
+                    )
+                    
+                    actionButton(
+                        title: "Habits",
+                        icon: "calendar.badge.clock",
+                        action: { viewModel.openHabits() }
+                    )
+                    
+                    actionButton(
+                        title: "Notifications",
+                        icon: "bell",
+                        action: { viewModel.openNotifications() }
+                    )
+                    
+                    actionButton(
                         title: "Settings",
                         icon: "gear",
                         action: { viewModel.openSettings() }
@@ -342,37 +360,31 @@ struct MenuBarView: View {
         }
     }
     
-    private func progressRow(label: String, time: TimeInterval, percentage: Double, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func progressRow(label: String, time: String, percentage: Double, color: Color) -> some View {
+        VStack(spacing: 4) {
             HStack {
                 Text(label)
                     .font(.subheadline)
-                
                 Spacer()
-                
-                Text(formatTime(time))
+                Text(time)
                     .font(.subheadline)
-                    .foregroundColor(.secondary)
-                
-                Text("(\(Int(percentage * 100))%)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                    .monospacedDigit()
             }
             
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Rectangle()
                         .fill(Color.gray.opacity(0.2))
-                        .frame(height: 8)
-                        .cornerRadius(4)
+                        .frame(width: geometry.size.width, height: 6)
+                        .cornerRadius(3)
                     
                     Rectangle()
                         .fill(color)
-                        .frame(width: max(0, CGFloat(percentage) * geometry.size.width), height: 8)
-                        .cornerRadius(4)
+                        .frame(width: max(geometry.size.width * percentage, 3), height: 6)
+                        .cornerRadius(3)
                 }
             }
-            .frame(height: 8)
+            .frame(height: 6)
         }
     }
     
@@ -388,19 +400,6 @@ struct MenuBarView: View {
             .padding(.vertical, 8)
         }
         .buttonStyle(.bordered)
-    }
-    
-    // MARK: - Helper Methods
-    
-    private func formatTime(_ timeInterval: TimeInterval) -> String {
-        let hours = Int(timeInterval) / 3600
-        let minutes = (Int(timeInterval) % 3600) / 60
-        
-        if hours > 0 {
-            return "\(hours)h \(minutes)m"
-        } else {
-            return "\(minutes)m"
-        }
     }
 }
 
@@ -468,15 +467,15 @@ struct CategoryPickerView: View {
 class MenuBarViewModel: ObservableObject {
     // MARK: - Published Properties
     
-    @Published var currentStatus: ActivityStatus = .unknown
+    @Published var currentStatus: ActivityStatus = .neutral
     @Published var isUserIdle: Bool = false
     @Published var currentApplication: ActivityRecord?
-    @Published var productiveTime: TimeInterval = 0
-    @Published var neutralTime: TimeInterval = 0
-    @Published var distractingTime: TimeInterval = 0
-    @Published var productivePercentage: Double = 0
-    @Published var neutralPercentage: Double = 0
-    @Published var distractingPercentage: Double = 0
+    @Published var productiveTime: String = "0h 0m"
+    @Published var neutralTime: String = "0h 0m"
+    @Published var distractingTime: String = "0h 0m"
+    @Published var productivePercentage: Double = 0.0
+    @Published var neutralPercentage: Double = 0.0
+    @Published var distractingPercentage: Double = 0.0
     @Published var showingCategorySheet: Bool = false
     
     // Things 3 integration
@@ -554,6 +553,27 @@ class MenuBarViewModel: ObservableObject {
         // Open the statistics window using the AppDelegate
         if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
             appDelegate.openStatistics()
+        }
+    }
+    
+    func openGoals() {
+        // Open the goals window using the AppDelegate
+        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            appDelegate.openGoals()
+        }
+    }
+    
+    func openHabits() {
+        // Open the habits window using the AppDelegate
+        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            appDelegate.openHabits()
+        }
+    }
+    
+    func openNotifications() {
+        // Open the notifications window using the AppDelegate
+        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            appDelegate.openNotifications()
         }
     }
     
@@ -701,9 +721,9 @@ class MenuBarViewModel: ObservableObject {
             }
             
             // Update time strings
-            productiveTime = productiveSeconds
-            neutralTime = neutralSeconds
-            distractingTime = distractingSeconds
+            productiveTime = Date.formatTimeInterval(productiveSeconds)
+            neutralTime = Date.formatTimeInterval(neutralSeconds)
+            distractingTime = Date.formatTimeInterval(distractingSeconds)
             
             // Calculate percentages
             let totalSeconds = productiveSeconds + neutralSeconds + distractingSeconds

@@ -33,6 +33,12 @@ protocol NotionCalendarService {
     
     /// Clears authentication and cached data
     func logout() -> AnyPublisher<Bool, Error>
+    
+    /// Fetches events for a specific database for a number of days
+    func fetchEvents(for databaseId: String, startDate: Date, days: Int) -> AnyPublisher<[NotionEvent], Error>
+    
+    /// Gets a list of selected databases for synchronization
+    func fetchSelectedDatabases() -> AnyPublisher<[NotionDatabase], Error>
 }
 
 /// Implementation of NotionCalendarService using the Notion API
@@ -367,6 +373,65 @@ final class NotionAPICalendarService: NotionCalendarService {
                 return success
             }
             .eraseToAnyPublisher()
+    }
+    
+    func fetchEvents(for databaseId: String, startDate: Date, days: Int) -> AnyPublisher<[NotionEvent], Error> {
+        guard isAuthenticated, let databaseId = activeDatabaseId else {
+            return Fail(error: NotionIntegrationError.notAuthenticated).eraseToAnyPublisher()
+        }
+        
+        // Check cache first
+        let cacheKey = "\(databaseId)_\(startDate.timeIntervalSince1970)_\(startDate.timeIntervalSince1970 + Double(days * 86400))"
+        if let cachedEvents = eventCache[cacheKey], 
+           let lastUpdate = lastCacheUpdate,
+           Date().timeIntervalSince(lastUpdate) < cacheTimeout {
+            return Just(cachedEvents)
+                .setFailureType(to: Error.self)
+                .eraseToAnyPublisher()
+        }
+        
+        // Build the query for the database
+        let query: [String: Any] = [
+            "filter": [
+                "and": [
+                    [
+                        "property": "Date",
+                        "date": [
+                            "on_or_after": formatDateForNotion(startDate)
+                        ]
+                    ],
+                    [
+                        "property": "Date",
+                        "date": [
+                            "on_or_before": formatDateForNotion(startDate.addingTimeInterval(Double(days * 86400)))
+                        ]
+                    ]
+                ]
+            ],
+            "sorts": [
+                [
+                    "property": "Date",
+                    "direction": "ascending"
+                ]
+            ]
+        ]
+        
+        return queryDatabase(databaseId: databaseId, query: query)
+            .map { [weak self] results -> [NotionEvent] in
+                let events = self?.parseEventsFromResults(results, databaseId: databaseId) ?? []
+                
+                // Cache the results
+                self?.eventCache[cacheKey] = events
+                self?.lastCacheUpdate = Date()
+                
+                return events
+            }
+            .eraseToAnyPublisher()
+    }
+    
+    func fetchSelectedDatabases() -> AnyPublisher<[NotionDatabase], Error> {
+        // Implementation needed
+        return Fail(error: NotionIntegrationError.notImplemented).eraseToAnyPublisher()
     }
     
     // MARK: - Private Methods

@@ -37,6 +37,45 @@ protocol ActivityRecordRepositoryProtocol {
     
     /// Publishes activity records as they are added
     var activityPublisher: AnyPublisher<ActivityRecord, Error> { get }
+    
+    /// Saves an activity record to the database
+    func saveActivity(_ activity: ActivityRecord) throws
+    
+    /// Retrieves an activity record by its ID
+    func getActivity(id: String) throws -> ActivityRecord?
+    
+    /// Retrieves activities in a range grouped by category
+    func getActivitiesInRangeGroupedByCategory(from: Date, to: Date) throws -> [String: [ActivityRecord]]
+    
+    /// Retrieves the latest activities
+    func getLatestActivities(limit: Int) throws -> [ActivityRecord]
+    
+    /// Retrieves the latest activities by category
+    func getLatestActivityByCategory(category: ActivityCategory, limit: Int) throws -> [ActivityRecord]
+    
+    /// Retrieves the top applications
+    func getTopApplications(from: Date, to: Date, limit: Int) throws -> [(applicationName: String, duration: TimeInterval)]
+    
+    /// Retrieves the top websites
+    func getTopWebsites(from: Date, to: Date, limit: Int) throws -> [(host: String, duration: TimeInterval)]
+    
+    /// Retrieves productivity by hour
+    func getProductivityByHour(from: Date, to: Date) throws -> [(hour: Int, productive: TimeInterval, neutral: TimeInterval, distracting: TimeInterval)]
+    
+    /// Retrieves productivity by day
+    func getProductivityByDay(days: Int) throws -> [(day: Date, productive: TimeInterval, neutral: TimeInterval, distracting: TimeInterval)]
+    
+    /// Retrieves time spent by category
+    func getTimeSpentByCategory(from: Date, to: Date) throws -> [(category: ActivityCategory, duration: TimeInterval)]
+    
+    /// Retrieves daily streak
+    func getDailyStreak(category: ActivityCategory, minimumSeconds: TimeInterval) throws -> Int
+    
+    /// Executes a time query
+    func executeTimeQuery(query: String, arguments: [DatabaseValueConvertible]) throws -> Double
+    
+    /// Executes a count query
+    func executeCountQuery(query: String, arguments: [DatabaseValueConvertible]) throws -> Double
 }
 
 /// Implementation of the ActivityRecordRepository using GRDB
@@ -263,6 +302,190 @@ final class ActivityRecordRepository: ActivityRecordRepositoryProtocol {
         logger.info("Cleared all activity data: \(deletedCount) records deleted")
         
         return deletedCount
+    }
+    
+    func saveActivity(_ activity: ActivityRecord) throws {
+        try databaseManager.write { db in
+            try activity.save(db)
+            
+            // Publish the new record
+            activitySubject.send(activity)
+            
+            // Update cache if necessary
+            self.cacheQueue.async {
+                self.invalidateCacheForDate(activity.startTime)
+            }
+        }
+    }
+    
+    func getActivity(id: String) throws -> ActivityRecord? {
+        // Check cache first
+        let cacheKey = "id_\(id)" as NSString
+        
+        if let cachedItem = getCachedItem(key: cacheKey) {
+            if let record = cachedItem.value as? ActivityRecord {
+                logger.debug("Cache hit for activity \(id)")
+                return record
+            }
+        }
+        
+        // If not in cache, query database
+        let record = try databaseManager.read { db in
+            try ActivityRecord.filter(Column("id") == id).fetchOne(db)
+        }
+        
+        // Add to cache if found
+        if let record = record {
+            cacheQueue.async {
+                self.cache.setObject(CacheItem(value: record), forKey: cacheKey)
+            }
+        }
+        
+        return record
+    }
+    
+    func getActivitiesInRangeGroupedByCategory(from startDate: Date, to endDate: Date) throws -> [String: [ActivityRecord]] {
+        let activities = try getActivitiesInRange(from: startDate, to: endDate)
+        var groupedActivities: [String: [ActivityRecord]] = [:]
+        
+        for activity in activities {
+            let category = activity.category.rawValue
+            if var categoryActivities = groupedActivities[category] {
+                categoryActivities.append(activity)
+            } else {
+                groupedActivities[category] = [activity]
+            }
+        }
+        
+        return groupedActivities
+    }
+    
+    func getLatestActivities(limit: Int) throws -> [ActivityRecord] {
+        return try getActivitiesInRange(from: Date().addingTimeInterval(-86400), to: Date())
+    }
+    
+    func getLatestActivityByCategory(category: ActivityCategory, limit: Int) throws -> [ActivityRecord] {
+        return try getActivitiesByCategory(category, limit: limit)
+    }
+    
+    func getTopApplications(from startDate: Date, to endDate: Date, limit: Int) throws -> [(applicationName: String, duration: TimeInterval)] {
+        let activities = try getActivitiesInRange(from: startDate, to: endDate)
+        var applicationDurations: [String: TimeInterval] = [:]
+        
+        for activity in activities {
+            let application = activity.applicationName
+            let duration = (activity.endTime ?? Date()).timeIntervalSince(activity.startTime)
+            applicationDurations[application, default: 0] += duration
+        }
+        
+        let sortedApplications = applicationDurations.sorted { $0.value > $1.value }
+        return Array(sortedApplications.prefix(limit)).map { ($0.key, $0.value) }
+    }
+    
+    func getTopWebsites(from startDate: Date, to endDate: Date, limit: Int) throws -> [(host: String, duration: TimeInterval)] {
+        let activities = try getActivitiesInRange(from: startDate, to: endDate)
+        var websiteDurations: [String: TimeInterval] = [:]
+        
+        for activity in activities {
+            if let url = activity.url, let host = URL(string: url)?.host {
+                let duration = (activity.endTime ?? Date()).timeIntervalSince(activity.startTime)
+                websiteDurations[host, default: 0] += duration
+            }
+        }
+        
+        let sortedWebsites = websiteDurations.sorted { $0.value > $1.value }
+        return Array(sortedWebsites.prefix(limit)).map { ($0.key, $0.value) }
+    }
+    
+    func getProductivityByHour(from startDate: Date, to endDate: Date) throws -> [(hour: Int, productive: TimeInterval, neutral: TimeInterval, distracting: TimeInterval)] {
+        let activities = try getActivitiesInRange(from: startDate, to: endDate)
+        var productivityByHour: [Int: (productive: TimeInterval, neutral: TimeInterval, distracting: TimeInterval)] = [:]
+        
+        for activity in activities {
+            let startTime = activity.startTime
+            let hour = Calendar.current.component(.hour, from: startTime)
+            let duration = (activity.endTime ?? Date()).timeIntervalSince(startTime)
+            
+            if activity.category == .productive {
+                productivityByHour[hour, default: (0, 0, 0)].productive += duration
+            } else if activity.category == .neutral {
+                productivityByHour[hour, default: (0, 0, 0)].neutral += duration
+            } else if activity.category == .distracting {
+                productivityByHour[hour, default: (0, 0, 0)].distracting += duration
+            }
+        }
+        
+        return productivityByHour.map { ($0.key, $0.value.productive, $0.value.neutral, $0.value.distracting) }
+    }
+    
+    func getProductivityByDay(days: Int) throws -> [(day: Date, productive: TimeInterval, neutral: TimeInterval, distracting: TimeInterval)] {
+        let activities = try getActivitiesInRange(from: Date().addingTimeInterval(-86400 * TimeInterval(days)), to: Date())
+        var productivityByDay: [Date: (productive: TimeInterval, neutral: TimeInterval, distracting: TimeInterval)] = [:]
+        
+        for activity in activities {
+            let startTime = activity.startTime
+            let day = Calendar.current.startOfDay(for: startTime)
+            let duration = (activity.endTime ?? Date()).timeIntervalSince(startTime)
+            
+            if activity.category == .productive {
+                productivityByDay[day, default: (0, 0, 0)].productive += duration
+            } else if activity.category == .neutral {
+                productivityByDay[day, default: (0, 0, 0)].neutral += duration
+            } else if activity.category == .distracting {
+                productivityByDay[day, default: (0, 0, 0)].distracting += duration
+            }
+        }
+        
+        return productivityByDay.map { ($0.key, $0.value.productive, $0.value.neutral, $0.value.distracting) }
+    }
+    
+    func getTimeSpentByCategory(from startDate: Date, to endDate: Date) throws -> [(category: ActivityCategory, duration: TimeInterval)] {
+        let activities = try getActivitiesInRange(from: startDate, to: endDate)
+        var timeSpentByCategory: [ActivityCategory: TimeInterval] = [:]
+        
+        for activity in activities {
+            let category = activity.category
+            let duration = (activity.endTime ?? Date()).timeIntervalSince(activity.startTime)
+            timeSpentByCategory[category, default: 0] += duration
+        }
+        
+        return timeSpentByCategory.map { ($0.key, $0.value) }
+    }
+    
+    func getDailyStreak(category: ActivityCategory, minimumSeconds: TimeInterval) throws -> Int {
+        let activities = try getActivitiesInRange(from: Date().addingTimeInterval(-86400), to: Date())
+        var streak = 0
+        var lastActivityDate: Date? = nil
+        
+        for activity in activities {
+            if activity.category == category {
+                let activityDate = Calendar.current.startOfDay(for: activity.startTime)
+                if let lastActivityDate = lastActivityDate {
+                    if activityDate == lastActivityDate {
+                        streak += 1
+                    } else {
+                        streak = 1
+                    }
+                }
+                lastActivityDate = activityDate
+            }
+        }
+        
+        return streak
+    }
+    
+    func executeTimeQuery(query: String, arguments: [DatabaseValueConvertible]) throws -> Double {
+        return try databaseManager.read { db in
+            let result = try Double.fetchOne(db, sql: query, arguments: StatementArguments(arguments)) ?? 0.0
+            return result
+        }
+    }
+    
+    func executeCountQuery(query: String, arguments: [DatabaseValueConvertible]) throws -> Double {
+        return try databaseManager.read { db in
+            let result = try Double.fetchOne(db, sql: query, arguments: StatementArguments(arguments)) ?? 0.0
+            return result
+        }
     }
     
     // MARK: - Private Methods

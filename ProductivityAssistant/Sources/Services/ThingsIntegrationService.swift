@@ -10,6 +10,9 @@ protocol ThingsIntegrationService {
     /// Fetches all tasks from Things 3
     func fetchTasks() -> AnyPublisher<[ThingsTask], Error>
     
+    /// Fetches all tasks (including completed) from Things 3 for synchronization
+    func fetchAllTasks() -> AnyPublisher<[ThingsTask], Error>
+    
     /// Fetches tasks filtered by project
     func fetchTasksByProject(project: String) -> AnyPublisher<[ThingsTask], Error>
     
@@ -70,6 +73,12 @@ final class AppleScriptThingsIntegration: ThingsIntegrationService {
     
     func fetchTasks() -> AnyPublisher<[ThingsTask], Error> {
         return executeThingsScript(fetchTasksScript())
+            .map { self.parseTasksFromScriptResult($0) }
+            .eraseToAnyPublisher()
+    }
+    
+    func fetchAllTasks() -> AnyPublisher<[ThingsTask], Error> {
+        return executeThingsScript(fetchAllTasksScript())
             .map { self.parseTasksFromScriptResult($0) }
             .eraseToAnyPublisher()
     }
@@ -307,6 +316,56 @@ final class AppleScriptThingsIntegration: ThingsIntegrationService {
             
             try
                 repeat with t in to dos
+                    set taskProps to {id:id of t, title:name of t, notes:notes of t, completed:completed of t}
+                    
+                    -- Handle due date
+                    if due date of t is not missing value then
+                        set taskProps to taskProps & {dueDate:(due date of t as string)}
+                    else
+                        set taskProps to taskProps & {dueDate:""}
+                    end if
+                    
+                    -- Handle tags
+                    set taskTags to {}
+                    repeat with aTag in tags of t
+                        set end of taskTags to name of aTag
+                    end repeat
+                    set taskProps to taskProps & {tags:taskTags}
+                    
+                    -- Handle project
+                    if project of t is not missing value then
+                        set taskProps to taskProps & {project:name of project of t}
+                    else
+                        set taskProps to taskProps & {project:""}
+                    end if
+                    
+                    -- Handle creation/modification dates
+                    set taskProps to taskProps & {creationDate:(creation date of t as string)}
+                    set taskProps to taskProps & {modificationDate:(modification date of t as string)}
+                    
+                    copy taskProps to end of taskList
+                end repeat
+                
+                return taskList
+            on error
+                return {}
+            end try
+        end tell
+        """
+    }
+    
+    private func fetchAllTasksScript() -> String {
+        return """
+        tell application "Things3"
+            set taskList to {}
+            
+            try
+                -- Get all to dos including completed
+                set allAreas to areas
+                set allProjects to projects
+                set allToDos to every to do
+                
+                repeat with t in allToDos
                     set taskProps to {id:id of t, title:name of t, notes:notes of t, completed:completed of t}
                     
                     -- Handle due date

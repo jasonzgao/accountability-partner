@@ -25,17 +25,23 @@ struct SettingsView: View {
                 }
                 .tag(2)
             
+            SyncSettingsView()
+                .tabItem {
+                    Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .tag(3)
+            
             NotificationsView()
                 .tabItem {
                     Label("Notifications", systemImage: "bell")
                 }
-                .tag(3)
+                .tag(4)
             
             AboutView()
                 .tabItem {
                     Label("About", systemImage: "info.circle")
                 }
-                .tag(4)
+                .tag(5)
         }
         .padding()
         .frame(width: 600, height: 500)

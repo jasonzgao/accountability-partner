@@ -2,84 +2,145 @@ import Foundation
 import Combine
 import os.log
 
-/// Protocol for synchronizing data with external services
-protocol SynchronizationService {
-    /// Starts the synchronization service
-    func start()
-    
-    /// Stops the synchronization service
-    func stop()
-    
-    /// Triggers an immediate synchronization
-    func syncNow() -> AnyPublisher<SyncResult, Error>
-    
-    /// Returns whether the service is currently syncing
-    var isSyncing: Bool { get }
-    
-    /// Returns whether the service is running
-    var isRunning: Bool { get }
-    
-    /// Returns the last sync time
-    var lastSyncTime: Date? { get }
-    
-    /// Returns the last sync result
-    var lastSyncResult: SyncResult? { get }
-    
-    /// Publisher for sync status updates
-    var syncStatusPublisher: AnyPublisher<SyncStatus, Never> { get }
-}
-
-/// Represents the result of a synchronization operation
+/// Defines the result of a synchronization operation
 struct SyncResult {
-    let startTime: Date
-    let endTime: Date
-    let success: Bool
-    let syncedServices: [String]
-    let errors: [String: Error]
+    let timestamp: Date
+    let successful: Bool
+    let errorMessage: String?
+    let itemsSynced: Int
     
-    var duration: TimeInterval {
-        return endTime.timeIntervalSince(startTime)
+    static func success(itemCount: Int) -> SyncResult {
+        return SyncResult(
+            timestamp: Date(),
+            successful: true,
+            errorMessage: nil,
+            itemsSynced: itemCount
+        )
+    }
+    
+    static func failure(error: Error) -> SyncResult {
+        return SyncResult(
+            timestamp: Date(),
+            successful: false,
+            errorMessage: error.localizedDescription,
+            itemsSynced: 0
+        )
     }
 }
 
 /// Represents the current status of synchronization
 enum SyncStatus {
     case idle
-    case syncing(progress: Double, service: String)
+    case syncing
     case error(message: String)
-    case success(result: SyncResult)
+    case offline
+    
+    var description: String {
+        switch self {
+        case .idle:
+            return "Idle"
+        case .syncing:
+            return "Syncing..."
+        case .error(let message):
+            return "Error: \(message)"
+        case .offline:
+            return "Offline"
+        }
+    }
 }
 
-/// Implementation of SynchronizationService
+/// Protocol defining the operations for synchronizing data with external services
+protocol SynchronizationService {
+    /// Starts the synchronization service with periodic syncs
+    func startService()
+    
+    /// Stops the synchronization service
+    func stopService()
+    
+    /// Triggers an immediate synchronization
+    func syncNow() -> AnyPublisher<SyncResult, Never>
+    
+    /// The current status of the synchronization
+    var syncStatus: SyncStatus { get }
+    
+    /// Whether the service is running
+    var isRunning: Bool { get }
+    
+    /// The time of the last sync
+    var lastSyncTime: Date? { get }
+    
+    /// The result of the last sync
+    var lastSyncResult: SyncResult? { get }
+    
+    /// Publisher for sync status changes
+    var syncStatusPublisher: AnyPublisher<SyncStatus, Never> { get }
+    
+    /// Publisher for sync results
+    var syncResultPublisher: AnyPublisher<SyncResult, Never> { get }
+}
+
+/// Errors specific to synchronization
+enum SynchronizationError: Error {
+    case offline
+    case serviceUnavailable(String)
+    case noDatabaseSelected
+    case thingsNotInstalled
+    case notionNotAuthenticated
+    case maxRetriesExceeded
+    case cancelled
+    
+    var localizedDescription: String {
+        switch self {
+        case .offline:
+            return "Device is offline"
+        case .serviceUnavailable(let service):
+            return "\(service) service is unavailable"
+        case .noDatabaseSelected:
+            return "No database selected for synchronization"
+        case .thingsNotInstalled:
+            return "Things 3 is not installed on this device"
+        case .notionNotAuthenticated:
+            return "Not authenticated with Notion"
+        case .maxRetriesExceeded:
+            return "Maximum retry attempts exceeded"
+        case .cancelled:
+            return "Synchronization was cancelled"
+        }
+    }
+}
+
+/// Implementation of the SynchronizationService
 final class DefaultSynchronizationService: SynchronizationService {
     // MARK: - Properties
     
     private let logger = Logger(subsystem: "com.productivityassistant", category: "Synchronization")
     private let userDefaults: UserDefaults
-    private let syncInterval: TimeInterval
-    private let retryLimit: Int
-    private let retryDelay: TimeInterval
-    
     private var syncTimer: Timer?
-    private var retryCount: [String: Int] = [:]
-    private var syncQueue = DispatchQueue(label: "com.productivityassistant.sync", qos: .utility)
-    private var isOffline: Bool = false
-    private var syncStatusSubject = CurrentValueSubject<SyncStatus, Never>(.idle)
+    private var retryTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
     
-    private var _isSyncing: Bool = false
-    private var _isRunning: Bool = false
+    // Status
+    private var _syncStatus: CurrentValueSubject<SyncStatus, Never>
     private var _lastSyncTime: Date?
     private var _lastSyncResult: SyncResult?
+    private var _isRunning: Bool = false
     
-    private enum UserDefaultsKeys {
-        static let lastSyncTime = "last_sync_time"
-    }
+    // Publishers
+    private let syncResultSubject = PassthroughSubject<SyncResult, Never>()
     
-    // MARK: - Public Properties
+    // Configuration
+    private let syncInterval: TimeInterval
+    private let maxRetryAttempts: Int
+    private let retryDelaySeconds: TimeInterval
+    private var currentRetryCount: Int = 0
     
-    var isSyncing: Bool {
-        return _isSyncing
+    // Services to sync
+    private let thingsService: ThingsIntegrationService?
+    private let notionService: NotionCalendarService?
+    
+    // Public properties
+    var syncStatus: SyncStatus {
+        return _syncStatus.value
     }
     
     var isRunning: Bool {
@@ -95,365 +156,333 @@ final class DefaultSynchronizationService: SynchronizationService {
     }
     
     var syncStatusPublisher: AnyPublisher<SyncStatus, Never> {
-        return syncStatusSubject.eraseToAnyPublisher()
+        return _syncStatus.eraseToAnyPublisher()
     }
     
-    // MARK: - Services to Sync
+    var syncResultPublisher: AnyPublisher<SyncResult, Never> {
+        return syncResultSubject.eraseToAnyPublisher()
+    }
     
-    private let thingsService: ThingsIntegrationService?
-    private let notionService: NotionCalendarService?
+    // UserDefaults keys
+    private enum UserDefaultsKeys {
+        static let lastSyncTime = "lastSyncTime"
+        static let syncInterval = "syncIntervalMinutes"
+        static let autoSyncEnabled = "autoSyncEnabled"
+    }
     
     // MARK: - Initialization
     
     init(
-        userDefaults: UserDefaults = .standard,
-        syncInterval: TimeInterval = 15 * 60, // 15 minutes
-        retryLimit: Int = 3,
-        retryDelay: TimeInterval = 60, // 1 minute
         thingsService: ThingsIntegrationService? = nil,
-        notionService: NotionCalendarService? = nil
+        notionService: NotionCalendarService? = nil,
+        userDefaults: UserDefaults = .standard,
+        syncInterval: TimeInterval = 30 * 60, // Default: 30 minutes
+        maxRetryAttempts: Int = 3,
+        retryDelaySeconds: TimeInterval = 60 // Default: 1 minute
     ) {
+        self.thingsService = thingsService
+        self.notionService = notionService
         self.userDefaults = userDefaults
-        self.syncInterval = syncInterval
-        self.retryLimit = retryLimit
-        self.retryDelay = retryDelay
+        self.syncInterval = userDefaults.double(forKey: UserDefaultsKeys.syncInterval) > 0 
+            ? userDefaults.double(forKey: UserDefaultsKeys.syncInterval) * 60 
+            : syncInterval
+        self.maxRetryAttempts = maxRetryAttempts
+        self.retryDelaySeconds = retryDelaySeconds
         
-        // Get services from app delegate if not provided
-        if let thingsService = thingsService {
-            self.thingsService = thingsService
-        } else if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-            self.thingsService = appDelegate.getThingsIntegrationService()
-        } else {
-            self.thingsService = nil
+        // Initialize status
+        self._syncStatus = CurrentValueSubject<SyncStatus, Never>(.idle)
+        
+        // Load last sync time from UserDefaults if available
+        if let lastSyncTimeDate = userDefaults.object(forKey: UserDefaultsKeys.lastSyncTime) as? Date {
+            self._lastSyncTime = lastSyncTimeDate
         }
         
-        if let notionService = notionService {
-            self.notionService = notionService
-        } else if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-            self.notionService = appDelegate.getNotionCalendarService()
-        } else {
-            self.notionService = nil
+        // Start service if auto-sync is enabled
+        if userDefaults.bool(forKey: UserDefaultsKeys.autoSyncEnabled) {
+            startService()
         }
         
-        // Load last sync time
-        if let lastSyncTimeInterval = userDefaults.object(forKey: UserDefaultsKeys.lastSyncTime) as? TimeInterval {
-            _lastSyncTime = Date(timeIntervalSince1970: lastSyncTimeInterval)
-        }
-        
-        // Setup network monitoring
-        setupNetworkMonitoring()
+        // Monitor network connectivity changes
+        monitorNetworkConnectivity()
     }
     
     // MARK: - Public Methods
     
-    func start() {
+    func startService() {
         guard !_isRunning else { return }
         
         logger.info("Starting synchronization service")
         _isRunning = true
         
         // Schedule periodic sync
-        scheduleSync()
+        schedulePeriodicSync()
         
-        // Initial sync if needed
-        if shouldPerformInitialSync() {
-            syncNow()
-                .sink(
-                    receiveCompletion: { [weak self] completion in
-                        if case .failure(let error) = completion {
-                            self?.logger.error("Initial sync failed: \(error.localizedDescription)")
-                        }
-                    },
-                    receiveValue: { [weak self] result in
-                        self?.logger.info("Initial sync completed: \(result.success ? "success" : "failure")")
-                    }
-                )
-                .store(in: &cancellables)
-        }
+        // Set auto-sync to enabled in user defaults
+        userDefaults.set(true, forKey: UserDefaultsKeys.autoSyncEnabled)
     }
     
-    func stop() {
+    func stopService() {
         guard _isRunning else { return }
         
         logger.info("Stopping synchronization service")
         _isRunning = false
         
-        // Cancel timer
+        // Invalidate timers
         syncTimer?.invalidate()
         syncTimer = nil
+        
+        retryTimer?.invalidate()
+        retryTimer = nil
+        
+        // Update status
+        _syncStatus.send(.idle)
+        
+        // Set auto-sync to disabled in user defaults
+        userDefaults.set(false, forKey: UserDefaultsKeys.autoSyncEnabled)
     }
     
-    func syncNow() -> AnyPublisher<SyncResult, Error> {
-        // If already syncing, return a publisher that will complete when the current sync is done
-        if _isSyncing {
-            return syncStatusPublisher
-                .filter { status in
-                    if case .success(let result) = status {
-                        return true
-                    }
-                    return false
-                }
-                .compactMap { status -> SyncResult? in
-                    if case .success(let result) = status {
-                        return result
-                    }
-                    return nil
-                }
-                .first()
-                .setFailureType(to: Error.self)
-                .eraseToAnyPublisher()
+    func syncNow() -> AnyPublisher<SyncResult, Never> {
+        // Already syncing, return a publisher that will complete when the current sync finishes
+        if case .syncing = _syncStatus.value {
+            logger.info("Sync already in progress, ignoring syncNow request")
+            return syncResultPublisher.first().eraseToAnyPublisher()
         }
         
-        return Future<SyncResult, Error> { [weak self] promise in
-            guard let self = self else {
-                promise(.failure(SyncError.serviceUnavailable))
-                return
-            }
-            
-            // Check if offline
-            if self.isOffline {
-                promise(.failure(SyncError.offline))
-                return
-            }
-            
-            self.syncQueue.async {
-                self._isSyncing = true
-                self.syncStatusSubject.send(.syncing(progress: 0.0, service: "Preparing"))
-                
-                let startTime = Date()
-                var syncedServices: [String] = []
-                var errors: [String: Error] = [:]
-                
-                // Create a group to wait for all syncs to complete
-                let group = DispatchGroup()
-                
-                // Sync Things 3
-                if let thingsService = self.thingsService {
-                    group.enter()
-                    self.syncThings(thingsService)
-                        .sink(
-                            receiveCompletion: { completion in
-                                if case .failure(let error) = completion {
-                                    self.logger.error("Things sync failed: \(error.localizedDescription)")
-                                    errors["Things"] = error
-                                    self.handleSyncError("Things", error: error)
-                                } else {
-                                    syncedServices.append("Things")
-                                }
-                                group.leave()
-                            },
-                            receiveValue: { _ in }
-                        )
-                        .store(in: &self.cancellables)
-                }
-                
-                // Sync Notion
-                if let notionService = self.notionService, notionService.isAuthenticated {
-                    group.enter()
-                    self.syncNotion(notionService)
-                        .sink(
-                            receiveCompletion: { completion in
-                                if case .failure(let error) = completion {
-                                    self.logger.error("Notion sync failed: \(error.localizedDescription)")
-                                    errors["Notion"] = error
-                                    self.handleSyncError("Notion", error: error)
-                                } else {
-                                    syncedServices.append("Notion")
-                                }
-                                group.leave()
-                            },
-                            receiveValue: { _ in }
-                        )
-                        .store(in: &self.cancellables)
-                }
-                
-                // Wait for all syncs to complete
-                group.notify(queue: self.syncQueue) {
-                    let endTime = Date()
-                    let success = errors.isEmpty
-                    
-                    // Create result
-                    let result = SyncResult(
-                        startTime: startTime,
-                        endTime: endTime,
-                        success: success,
-                        syncedServices: syncedServices,
-                        errors: errors
-                    )
-                    
-                    // Update state
-                    self._isSyncing = false
-                    self._lastSyncTime = endTime
-                    self._lastSyncResult = result
-                    
-                    // Save last sync time
-                    self.userDefaults.set(endTime.timeIntervalSince1970, forKey: UserDefaultsKeys.lastSyncTime)
-                    
-                    // Log result
-                    if success {
-                        self.logger.info("Sync completed successfully in \(result.duration) seconds")
-                        self.syncStatusSubject.send(.success(result: result))
-                    } else {
-                        self.logger.error("Sync completed with errors: \(errors.count) services failed")
-                        self.syncStatusSubject.send(.error(message: "Sync completed with errors"))
-                    }
-                    
-                    // Reset retry counts for successful services
-                    for service in syncedServices {
-                        self.retryCount[service] = 0
-                    }
-                    
-                    promise(.success(result))
-                }
-            }
+        logger.info("Initiating immediate sync")
+        _syncStatus.send(.syncing)
+        
+        // Check network connectivity
+        if !isNetworkReachable() {
+            logger.warning("Device is offline, cannot sync")
+            let result = SyncResult.failure(error: SynchronizationError.offline)
+            handleSyncCompletion(result: result)
+            return Just(result).eraseToAnyPublisher()
         }
-        .eraseToAnyPublisher()
+        
+        // Perform sync for all services
+        return performFullSync()
+            .handleEvents(
+                receiveOutput: { [weak self] result in
+                    self?.handleSyncCompletion(result: result)
+                },
+                receiveCompletion: { [weak self] completion in
+                    if case .failure(let error) = completion {
+                        self?.logger.error("Sync failed: \(error.localizedDescription)")
+                        let result = SyncResult.failure(error: error)
+                        self?.handleSyncCompletion(result: result)
+                    }
+                }
+            )
+            .catch { error -> Just<SyncResult> in
+                return Just(SyncResult.failure(error: error))
+            }
+            .eraseToAnyPublisher()
     }
     
     // MARK: - Private Methods
     
-    private func scheduleSync() {
-        // Cancel existing timer
+    private func schedulePeriodicSync() {
+        // Cancel existing timer if any
         syncTimer?.invalidate()
         
         // Create new timer
-        syncTimer = Timer.scheduledTimer(withTimeInterval: syncInterval, repeats: true) { [weak self] _ in
-            guard let self = self, self._isRunning, !self._isSyncing else { return }
+        syncTimer = Timer.scheduledTimer(
+            withTimeInterval: syncInterval,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self = self else { return }
             
+            // Skip sync if we're already syncing
+            if case .syncing = self._syncStatus.value {
+                self.logger.info("Skipping scheduled sync - sync already in progress")
+                return
+            }
+            
+            self.logger.info("Starting scheduled sync")
             self.syncNow()
-                .sink(
-                    receiveCompletion: { completion in
-                        if case .failure(let error) = completion {
-                            self.logger.error("Scheduled sync failed: \(error.localizedDescription)")
-                        }
-                    },
-                    receiveValue: { _ in }
-                )
+                .sink { _ in }
                 .store(in: &self.cancellables)
         }
         
-        // Make sure timer fires even when the app is idle
+        // Make sure timer fires even when the app is in background
         RunLoop.current.add(syncTimer!, forMode: .common)
-    }
-    
-    private func shouldPerformInitialSync() -> Bool {
-        // If never synced before, do initial sync
-        guard let lastSyncTime = _lastSyncTime else {
-            return true
+        
+        // Also perform an immediate sync on startup if it's been a while
+        if let lastSyncTime = _lastSyncTime, 
+           Date().timeIntervalSince(lastSyncTime) > syncInterval {
+            logger.info("Performing initial sync on service start")
+            syncNow()
+                .sink { _ in }
+                .store(in: &cancellables)
         }
-        
-        // If last sync was more than 2x the sync interval ago, do initial sync
-        return Date().timeIntervalSince(lastSyncTime) > (syncInterval * 2)
     }
     
-    private func setupNetworkMonitoring() {
-        // In a real app, we would use NWPathMonitor to detect network changes
-        // For simplicity, we'll assume we're always online
-        isOffline = false
-    }
-    
-    private func handleSyncError(_ service: String, error: Error) {
-        // Increment retry count
-        let currentRetryCount = retryCount[service] ?? 0
-        retryCount[service] = currentRetryCount + 1
-        
-        // If we haven't reached the retry limit, schedule a retry
-        if currentRetryCount < retryLimit {
-            let delay = retryDelay * Double(currentRetryCount + 1)
-            logger.info("Scheduling retry for \(service) in \(delay) seconds (attempt \(currentRetryCount + 1)/\(retryLimit))")
+    private func handleSyncCompletion(result: SyncResult) {
+        // Update status based on result
+        if result.successful {
+            _syncStatus.send(.idle)
+            _lastSyncTime = result.timestamp
+            currentRetryCount = 0  // Reset retry count on success
             
-            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self = self, self._isRunning, !self._isSyncing else { return }
+            // Save last sync time to UserDefaults
+            userDefaults.set(result.timestamp, forKey: UserDefaultsKeys.lastSyncTime)
+        } else {
+            if !isNetworkReachable() {
+                _syncStatus.send(.offline)
+            } else {
+                _syncStatus.send(.error(message: result.errorMessage ?? "Unknown error"))
                 
-                self.logger.info("Retrying sync for \(service)")
-                
-                // Retry the specific service
-                if service == "Things", let thingsService = self.thingsService {
-                    self.syncThings(thingsService)
-                        .sink(
-                            receiveCompletion: { completion in
-                                if case .failure(let error) = completion {
-                                    self.logger.error("Things retry failed: \(error.localizedDescription)")
-                                    self.handleSyncError("Things", error: error)
-                                } else {
-                                    self.logger.info("Things retry succeeded")
-                                    self.retryCount["Things"] = 0
-                                }
-                            },
-                            receiveValue: { _ in }
-                        )
-                        .store(in: &self.cancellables)
-                } else if service == "Notion", let notionService = self.notionService, notionService.isAuthenticated {
-                    self.syncNotion(notionService)
-                        .sink(
-                            receiveCompletion: { completion in
-                                if case .failure(let error) = completion {
-                                    self.logger.error("Notion retry failed: \(error.localizedDescription)")
-                                    self.handleSyncError("Notion", error: error)
-                                } else {
-                                    self.logger.info("Notion retry succeeded")
-                                    self.retryCount["Notion"] = 0
-                                }
-                            },
-                            receiveValue: { _ in }
-                        )
-                        .store(in: &self.cancellables)
+                // Schedule retry if not reached max attempts
+                if currentRetryCount < maxRetryAttempts {
+                    scheduleRetry()
                 }
             }
-        } else {
-            logger.warning("Retry limit reached for \(service), giving up")
-            retryCount[service] = 0
         }
+        
+        // Update last result
+        _lastSyncResult = result
+        
+        // Emit result to subscribers
+        syncResultSubject.send(result)
+        
+        logger.info("Sync completed: \(result.successful ? "Success" : "Failed"), Items: \(result.itemsSynced)")
     }
     
-    // MARK: - Service-Specific Sync Methods
-    
-    private func syncThings(_ service: ThingsIntegrationService) -> AnyPublisher<Void, Error> {
-        self.syncStatusSubject.send(.syncing(progress: 0.3, service: "Things"))
+    private func scheduleRetry() {
+        currentRetryCount += 1
         
-        // For Things, we just need to fetch the latest tasks
-        // This is a read-only operation, so there's no conflict resolution needed
-        return service.fetchTasks()
-            .map { _ in () }
+        // Cancel existing retry timer if any
+        retryTimer?.invalidate()
+        
+        // Calculate exponential backoff delay
+        let delay = retryDelaySeconds * pow(2.0, Double(currentRetryCount - 1))
+        logger.info("Scheduling retry #\(currentRetryCount) in \(Int(delay)) seconds")
+        
+        // Create new timer
+        retryTimer = Timer.scheduledTimer(
+            withTimeInterval: delay,
+            repeats: false
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            
+            self.logger.info("Executing retry #\(self.currentRetryCount)")
+            self.syncNow()
+                .sink { _ in }
+                .store(in: &self.cancellables)
+        }
+        
+        // Make sure timer fires even when the app is in background
+        RunLoop.current.add(retryTimer!, forMode: .common)
+    }
+    
+    private func performFullSync() -> AnyPublisher<SyncResult, Error> {
+        var publishers = [AnyPublisher<Int, Error>]()
+        
+        // Add Things sync if available
+        if let thingsService = thingsService {
+            publishers.append(syncThings(service: thingsService))
+        }
+        
+        // Add Notion sync if available
+        if let notionService = notionService {
+            publishers.append(syncNotion(service: notionService))
+        }
+        
+        // If no services to sync, return empty success
+        if publishers.isEmpty {
+            return Just(SyncResult.success(itemCount: 0))
+                .setFailureType(to: Error.self)
+                .eraseToAnyPublisher()
+        }
+        
+        // Combine all sync operations
+        return Publishers.MergeMany(publishers)
+            .collect()
+            .map { itemCounts in
+                let totalItems = itemCounts.reduce(0, +)
+                return SyncResult.success(itemCount: totalItems)
+            }
             .eraseToAnyPublisher()
     }
     
-    private func syncNotion(_ service: NotionCalendarService) -> AnyPublisher<Void, Error> {
-        self.syncStatusSubject.send(.syncing(progress: 0.6, service: "Notion"))
-        
-        // For Notion, we just need to fetch the latest events
-        // This is a read-only operation, so there's no conflict resolution needed
-        guard let databaseId = service.activeDatabaseId else {
-            return Fail(error: SyncError.noDatabaseSelected).eraseToAnyPublisher()
-        }
-        
-        // Fetch events for the next 7 days
-        let now = Date()
-        let nextWeek = Calendar.current.date(byAdding: .day, value: 7, to: now)!
-        
-        return service.fetchEvents(from: now, to: nextWeek)
-            .map { _ in () }
+    private func syncThings(service: ThingsIntegrationService) -> AnyPublisher<Int, Error> {
+        return service.fetchAllTasks()
+            .map { tasks in
+                self.logger.info("Synced \(tasks.count) tasks from Things")
+                return tasks.count
+            }
+            .mapError { error in
+                self.logger.error("Things sync error: \(error.localizedDescription)")
+                
+                if let thingsError = error as? ThingsIntegrationError {
+                    switch thingsError {
+                    case .notInstalled:
+                        return SynchronizationError.thingsNotInstalled
+                    default:
+                        return SynchronizationError.serviceUnavailable("Things 3")
+                    }
+                }
+                return error
+            }
             .eraseToAnyPublisher()
     }
-}
-
-/// Error types for synchronization
-enum SyncError: Error {
-    case offline
-    case serviceUnavailable
-    case noDatabaseSelected
-    case unknown
     
-    var localizedDescription: String {
-        switch self {
-        case .offline:
-            return "Device is offline"
-        case .serviceUnavailable:
-            return "Synchronization service is unavailable"
-        case .noDatabaseSelected:
-            return "No database selected for Notion"
-        case .unknown:
-            return "An unknown synchronization error occurred"
-        }
+    private func syncNotion(service: NotionCalendarService) -> AnyPublisher<Int, Error> {
+        return service.fetchSelectedDatabases()
+            .flatMap { databases -> AnyPublisher<[NotionEvent], Error> in
+                guard !databases.isEmpty else {
+                    return Fail(error: SynchronizationError.noDatabaseSelected)
+                        .eraseToAnyPublisher()
+                }
+                
+                // Fetch events for each database and combine results
+                let eventPublishers = databases.map { database in
+                    return service.fetchEvents(for: database.id, startDate: Date(), days: 7)
+                }
+                
+                return Publishers.MergeMany(eventPublishers)
+                    .collect()
+                    .map { eventArrays in
+                        return eventArrays.flatMap { $0 }
+                    }
+                    .eraseToAnyPublisher()
+            }
+            .map { events in
+                self.logger.info("Synced \(events.count) events from Notion")
+                return events.count
+            }
+            .mapError { error in
+                self.logger.error("Notion sync error: \(error.localizedDescription)")
+                
+                if let notionError = error as? NotionIntegrationError {
+                    switch notionError {
+                    case .notAuthenticated, .invalidToken:
+                        return SynchronizationError.notionNotAuthenticated
+                    case .databaseNotFound:
+                        return SynchronizationError.noDatabaseSelected
+                    default:
+                        return SynchronizationError.serviceUnavailable("Notion")
+                    }
+                }
+                return error
+            }
+            .eraseToAnyPublisher()
+    }
+    
+    private func isNetworkReachable() -> Bool {
+        // Simple implementation - in a real app, this would use NWPathMonitor
+        // or Reachability to check for actual network connectivity
+        
+        // For now, we'll assume the network is available
+        return true
+    }
+    
+    private func monitorNetworkConnectivity() {
+        // In a real app, we would use NWPathMonitor to monitor network changes
+        // and update our sync status accordingly
+        
+        // For demonstration purposes, we'll simulate being online
+        // A real implementation would set up a PathMonitor and listen for status changes
     }
 } 
+ 
